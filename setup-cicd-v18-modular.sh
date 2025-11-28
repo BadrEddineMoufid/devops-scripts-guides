@@ -183,11 +183,12 @@ show_main_menu() {
     echo "  3) 📦 Install Services   - Install individual services"
     echo "  4) 📝 Regenerate Files   - Regenerate config/workflow files"
     echo "  5) 🔄 Restore Backup     - Restore from backup"
-    echo "  6) ❌ Exit"
+    echo "  6) 🗑️ Uninstall Services - Remove installed components"
+    echo "  7) ❌ Exit"
     echo ""
     
     local choice
-    choice=$(prompt_user "Enter your choice [1-6]" "1")
+    choice=$(prompt_user "Enter your choice [1-7]" "1")
     
     case $choice in
         1) OPERATION_MODE="full" ;;
@@ -195,7 +196,8 @@ show_main_menu() {
         3) OPERATION_MODE="install" ;;
         4) OPERATION_MODE="regenerate" ;;
         5) OPERATION_MODE="restore" ;;
-        6) exit 0 ;;
+        6) OPERATION_MODE="uninstall" ;; # <--- NEW
+        7) exit 0 ;;
         *) log_error "Invalid choice"; show_main_menu ;;
     esac
 }
@@ -510,11 +512,12 @@ show_install_menu() {
     echo "  4) RabbitMQ"
     echo "  5) Node.js/NVM"
     echo "  6) Nginx"
-    echo "  7) All Services"
-    echo "  8) Back to Main Menu"
+    echo "  7) Docker (Engine & Compose)"  # <--- NEW
+    echo "  8) All Services (Excluding Docker)"
+    echo "  9) Back to Main Menu"
     echo ""
     
-    local choice=$(prompt_user "Enter your choice [1-8]" "1")
+    local choice=$(prompt_user "Enter your choice [1-9]" "1")
     
     case $choice in
         1) install_java_interactive ;;
@@ -523,11 +526,14 @@ show_install_menu() {
         4) install_rabbitmq_interactive ;;
         5) install_node_interactive ;;
         6) install_nginx_interactive ;;
-        7) install_all_services ;;
-        8) show_main_menu ;;
+        7) install_docker_interactive ;;      # <--- NEW
+        8) install_all_services ;;
+        9) show_main_menu ;;
         *) log_error "Invalid choice"; show_install_menu ;;
     esac
 }
+
+
 
 install_java_interactive() {
     log_section "Installing Java"
@@ -584,11 +590,84 @@ install_postgresql_interactive() {
 install_redis_interactive() {
     log_section "Installing Redis"
     
-    if [ "$DRY_RUN" = false ]; then
+    # 1. Install Redis Server (System)
+    log_info "Checking available Redis version..."
+    local candidate_ver=$(apt-cache policy redis-server | grep Candidate | awk '{print $2}')
+    
+    if [ -z "$candidate_ver" ]; then
+        [ "$DRY_RUN" = false ] && apt update -y
+        candidate_ver=$(apt-cache policy redis-server | grep Candidate | awk '{print $2}')
+    fi
+
+    echo ""
+    echo "  Package: redis-server"
+    echo "  Version: ${candidate_ver:-Unknown}"
+    echo ""
+    
+    local confirm=$(prompt_user "Install Redis Server? [Y/n]" "Y")
+    
+    if [[ ! "$confirm" =~ ^[Nn]$ ]] && [ "$DRY_RUN" = false ]; then
         apt update -y
         apt install -y redis-server
+        systemctl enable redis-server
+        systemctl start redis-server
         log_success "Redis installed (Port: 6379)"
     fi
+    
+    # 2. Redis UI Selection
+    echo ""
+    echo "Redis UI Options:"
+    echo "  1) Redis Commander (NPM - Lightweight, requires Node.js)"
+    echo "  2) Redis Insight   (Docker - Full Featured, requires Docker)"
+    echo "  3) None"
+    
+    local ui_choice=$(prompt_user "Choose UI [1-3]" "3")
+    
+    case $ui_choice in
+        1) # Redis Commander
+            collect_user_config
+            if sudo -u "$TARGET_USER" bash -c 'command -v npm' &>/dev/null; then
+                if [ "$DRY_RUN" = false ]; then
+                    log_info "Installing Redis Commander..."
+                    sudo -u "$TARGET_USER" bash -c 'npm install -g redis-commander'
+                    
+                    # Service file logic
+                    cat > "/etc/systemd/system/redis-commander.service" <<EOF
+[Unit]
+Description=Redis Commander Web UI
+After=network.target redis-server.service
+[Service]
+User=$TARGET_USER
+ExecStart=$(sudo -u "$TARGET_USER" bash -c 'which redis-commander')
+Environment=PORT=8081
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+                    systemctl daemon-reload
+                    systemctl enable redis-commander
+                    systemctl start redis-commander
+                    log_success "Redis Commander installed (http://YOUR_IP:8081)"
+                fi
+            else
+                log_error "Node.js not found. Install Node/NVM first."
+            fi
+            ;;
+            
+        2) # Redis Insight (Docker)
+            if command -v docker &> /dev/null; then
+                if [ "$DRY_RUN" = false ]; then
+                    log_info "Deploying Redis Insight Container..."
+                    docker pull redis/redisinsight:latest
+                    # Run on port 5540 (default)
+                    docker run -d --name redis-insight --restart always -p 5540:5540 -v redisinsight:/data redis/redisinsight:latest
+                    log_success "Redis Insight installed (http://YOUR_IP:5540)"
+                fi
+            else
+                log_error "Docker not found. Please install Docker first (Option 7)."
+            fi
+            ;;
+    esac
     
     show_install_menu
 }
@@ -596,11 +675,31 @@ install_redis_interactive() {
 install_rabbitmq_interactive() {
     log_section "Installing RabbitMQ"
     
-    if [ "$DRY_RUN" = false ]; then
-        apt update -y
-        apt install -y rabbitmq-server
-        rabbitmq-plugins enable rabbitmq_management
-        log_success "RabbitMQ installed (UI: http://localhost:15672 - guest/guest)"
+    log_info "Checking available RabbitMQ version..."
+    local candidate_ver=$(apt-cache policy rabbitmq-server | grep Candidate | awk '{print $2}')
+    
+    echo ""
+    echo "  Package: rabbitmq-server"
+    echo "  Version: ${candidate_ver:-Unknown}"
+    echo ""
+    
+    local confirm=$(prompt_user "Proceed with installation? [Y/n]" "Y")
+    
+    if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+        if [ "$DRY_RUN" = false ]; then
+            apt update -y
+            apt install -y rabbitmq-server
+            
+            log_info "Enabling Management Plugin..."
+            rabbitmq-plugins enable rabbitmq_management
+            
+            systemctl enable rabbitmq-server
+            systemctl start rabbitmq-server
+            
+            log_success "RabbitMQ installed (UI: http://localhost:15672 - guest/guest)"
+        fi
+    else
+        log_warning "Installation cancelled."
     fi
     
     show_install_menu
@@ -645,6 +744,53 @@ install_nginx_interactive() {
     show_install_menu
 }
 
+install_docker_interactive() {
+    log_section "Installing Docker"
+    
+    if command -v docker &> /dev/null; then
+        log_warning "Docker is already installed."
+        docker --version
+    else
+        echo "This will install Docker Engine (Community) from the official repository."
+        local confirm=$(prompt_user "Proceed? [Y/n]" "Y")
+        
+        if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+            if [ "$DRY_RUN" = false ]; then
+                log_info "Setting up Docker repository..."
+                # Clean up old versions
+                apt remove -y docker docker-engine docker.io containerd runc || true
+                
+                # Deps
+                apt update -y
+                apt install -y ca-certificates curl gnupg
+                
+                # GPG Key
+                install -m 0755 -d /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                chmod a+r /etc/apt/keyrings/docker.gpg
+                
+                # Repository
+                echo \
+                  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+                  tee /etc/apt/sources.list.d/docker.list > /dev/null
+                
+                # Install
+                apt update -y
+                apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+                
+                # Permissions
+                collect_user_config
+                log_info "Adding $TARGET_USER to 'docker' group..."
+                usermod -aG docker "$TARGET_USER"
+                
+                log_success "Docker installed. $TARGET_USER can run docker commands (requires logout/login)."
+            fi
+        fi
+    fi
+    show_install_menu
+}
+
 install_all_services() {
     log_info "Installing all services..."
     
@@ -665,6 +811,147 @@ install_all_services() {
     
     show_install_menu
 }
+
+# ==============================================================================
+# UNINSTALL MODE FUNCTIONS
+# ==============================================================================
+
+show_uninstall_menu() {
+    log_section "Uninstall Services Menu"
+    
+    echo "⚠️  WARNING: Uninstalling services stops them immediately."
+    echo "   Data backups will be attempted for Redis only."
+    echo "   NOTE: Docker and PostgreSQL must be uninstalled manually to prevent accidental data loss."
+    echo ""
+    echo "  1) Redis (Auto-Backup & Remove)"
+    echo "  2) RabbitMQ"
+    echo "  3) Nginx"
+    echo "  4) Java (OpenJDK)"
+    echo "  5) Node.js/NVM (For Target User)"
+    echo "  6) Back to Main Menu"
+    echo ""
+    
+    local choice=$(prompt_user "Enter your choice [1-6]" "6")
+    
+    case $choice in
+        1) uninstall_redis_interactive ;;
+        2) uninstall_named_service "rabbitmq-server" "RabbitMQ" ;;
+        3) uninstall_named_service "nginx" "Nginx" ;;
+        4) uninstall_java_interactive ;;
+        5) uninstall_node_interactive ;;
+        6) show_main_menu ;;
+        *) log_error "Invalid choice"; show_uninstall_menu ;;
+    esac
+}
+
+uninstall_named_service() {
+    local pkg_name=$1
+    local human_name=$2
+    
+    log_section "Uninstalling $human_name"
+    local confirm=$(prompt_user "Are you sure you want to uninstall $human_name? [y/N]" "N")
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        if [ "$DRY_RUN" = false ]; then
+            log_info "Stopping and removing $pkg_name..."
+            systemctl stop "$pkg_name" || true
+            apt remove --purge -y "$pkg_name"
+            apt autoremove -y
+            log_success "$human_name uninstalled."
+        fi
+    else
+        log_warning "Cancelled."
+    fi
+    show_uninstall_menu
+}
+
+uninstall_redis_interactive() {
+    log_section "Uninstalling Redis"
+    
+    local confirm=$(prompt_user "Are you sure you want to uninstall Redis? [y/N]" "N")
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then show_uninstall_menu; return; fi
+
+    if [ "$DRY_RUN" = false ]; then
+        log_info "Stopping Redis service..."
+        systemctl stop redis-server || true
+        
+        # --- BACKUP LOGIC ---
+        local redis_dump="/var/lib/redis/dump.rdb"
+        local backup_file="$BACKUP_ROOT/redis_dump_$TIMESTAMP.rdb"
+        
+        if [ -f "$redis_dump" ]; then
+            log_info "Found Redis data dump. Creating backup..."
+            mkdir -p "$BACKUP_ROOT"
+            cp "$redis_dump" "$backup_file"
+            log_success "Redis data backed up to: $backup_file"
+        else
+            log_warning "No Redis dump.rdb found. Skipping backup."
+        fi
+        
+        # --- UNINSTALL ---
+        log_info "Removing Redis packages..."
+        apt remove --purge -y redis-server
+        apt autoremove -y
+        
+        # Remove UI if exists
+        if [ -f "/etc/systemd/system/redis-commander.service" ]; then
+            log_info "Removing Redis Commander UI..."
+            systemctl stop redis-commander
+            systemctl disable redis-commander
+            rm /etc/systemd/system/redis-commander.service
+            systemctl daemon-reload
+        fi
+        
+        log_success "Redis uninstalled successfully."
+        if [ -f "$backup_file" ]; then
+            echo -e "${YELLOW}📝 REMINDER: Your data backup is at: $backup_file${NC}"
+        fi
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+    show_uninstall_menu
+}
+
+
+uninstall_java_interactive() {
+    log_section "Uninstalling Java"
+    echo "This will remove 'openjdk-*-jre-headless' packages."
+    local confirm=$(prompt_user "Proceed? [y/N]" "N")
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        if [ "$DRY_RUN" = false ]; then
+            log_info "Removing OpenJDK packages..."
+            apt remove --purge -y "openjdk-*-jre-headless"
+            apt autoremove -y
+            log_success "Java uninstalled."
+        fi
+    fi
+    show_uninstall_menu
+}
+
+uninstall_node_interactive() {
+    log_section "Uninstalling Node.js/NVM"
+    collect_user_config
+    
+    echo "This will remove NVM and all Node versions for user: $TARGET_USER"
+    local confirm=$(prompt_user "Are you sure? [y/N]" "N")
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        if [ "$DRY_RUN" = false ]; then
+            log_info "Removing .nvm directory for $TARGET_USER..."
+            # Careful removal of specific directory
+            if [ -d "/home/$TARGET_USER/.nvm" ]; then
+                rm -rf "/home/$TARGET_USER/.nvm"
+                log_success "NVM removed for $TARGET_USER."
+            else
+                log_warning "NVM directory not found for $TARGET_USER."
+            fi
+        fi
+    fi
+    show_uninstall_menu
+}
+
 
 # ==============================================================================
 # REGENERATE MODE FUNCTIONS
@@ -1187,9 +1474,17 @@ update_db_password() {
 restore_from_backup() {
     log_section "Restore Mode"
     
+    # 1. Check if backup root exists
     if [ ! -d "$BACKUP_ROOT" ]; then
-        log_error "No backups found in $BACKUP_ROOT"
-        exit 1
+        log_warning "No backup directory found at $BACKUP_ROOT"
+        echo "Run a Full Setup or Update Config first to generate backups."
+        return 0 # Exit function gracefully instead of crashing script
+    fi
+    
+    # 2. Check if directory is empty
+    if [ -z "$(ls -A "$BACKUP_ROOT")" ]; then
+        log_warning "Backup directory is empty."
+        return 0
     fi
     
     echo "Available backups:"
@@ -1197,27 +1492,43 @@ restore_from_backup() {
     echo ""
     
     local restore_ts=$(prompt_user "Enter timestamp to restore" "")
+    
+    # 3. Handle empty input
+    if [ -z "$restore_ts" ]; then
+        log_error "No timestamp entered."
+        return 1
+    fi
+
     local restore_source="$BACKUP_ROOT/$restore_ts"
     
     if [ ! -d "$restore_source" ]; then
         log_error "Backup not found: $restore_source"
-        exit 1
+        return 1
     fi
     
     log_info "Restoring from $restore_source..."
     
-    [ -f "$restore_source/default" ] && cp "$restore_source/default" "/etc/nginx/sites-available/default"
+    # Restore Nginx
+    if [ -f "$restore_source/default" ]; then
+        cp "$restore_source/default" "/etc/nginx/sites-available/default"
+        log_success "Restored Nginx config"
+    fi
     
+    # Restore Services
     for f in "$restore_source"/*.service; do
-        [ -f "$f" ] && cp "$f" "/etc/systemd/system/$(basename "$f")"
+        if [ -f "$f" ]; then
+            cp "$f" "/etc/systemd/system/$(basename "$f")"
+            log_success "Restored $(basename "$f")"
+        fi
     done
     
+    # Reload
     systemctl daemon-reload
     if command -v nginx &> /dev/null; then
         nginx -t && systemctl reload nginx
     fi
     
-    log_success "Restore complete"
+    log_success "Restore operation complete."
 }
 
 # ==============================================================================
@@ -1353,18 +1664,25 @@ main() {
         esac
     done
     
-    # Show menu and execute
-    if [ -z "$OPERATION_MODE" ]; then
+    # Loop the menu unless an operation mode was passed via args (future proofing)
+    while true; do
+        # Reset mode
+        OPERATION_MODE=""
+        
         show_main_menu
-    fi
-    
-    case $OPERATION_MODE in
-        full) run_full_setup ;;
-        update) show_update_menu ;;
-        install) show_install_menu ;;
-        regenerate) show_regenerate_menu ;;
-        restore) restore_from_backup ;;
-    esac
+        
+        case $OPERATION_MODE in
+            full) run_full_setup ;;
+            update) show_update_menu ;;
+            install) show_install_menu ;;
+            regenerate) show_regenerate_menu ;;
+            restore) restore_from_backup ;;
+            uninstall) show_uninstall_menu ;; # <--- NEW
+        esac
+        
+        echo ""
+        read -p "Press Enter to continue..."
+    done
 }
 
 # Run main
