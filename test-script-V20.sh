@@ -231,10 +231,7 @@ main_chunk1() {
 	# Next chunks will implement version fetchers, templates, sudoers wrapper, redis handling, etc.
 }
 
-# Run main for chunk1 when the file is executed directly
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-	main_chunk1 "$@"
-fi
+
 
 # -----------------------------------------------------------------------------
 # Chunk 2: Template renderer and default templates
