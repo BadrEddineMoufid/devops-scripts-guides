@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# AUTOMATED CI/CD SETUP V15: The Final Edition (Polished & Robust)
+# AUTOMATED CI/CD SETUP V15
+# ORIGINAL SCRIPT VERSION  
+# AUTHOR: Badr Eddine Moufid
 # ==============================================================================
 
 set -e

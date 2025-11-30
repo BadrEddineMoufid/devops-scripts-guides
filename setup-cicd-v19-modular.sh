@@ -1,9 +1,10 @@
 #!/bin/bash
 
 # ==============================================================================
-# AUTOMATED CI/CD SETUP V18: The Modular Edition
+# AUTOMATED CI/CD SETUP V19: The Robust Edition
 # ==============================================================================
 # A comprehensive, production-ready automation script with modular operation modes
+# Includes Docker integration, safe configs, and smart detection.
 # ==============================================================================
 
 set -e
@@ -12,7 +13,7 @@ set -e
 # CONSTANTS & CONFIGURATION
 # ==============================================================================
 
-readonly SCRIPT_VERSION="18.0"
+readonly SCRIPT_VERSION="19"
 readonly BACKUP_ROOT="/var/backups/server-setup"
 readonly TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
@@ -28,6 +29,9 @@ readonly NC='\033[0m'
 # Global Flags
 DRY_RUN=false
 OPERATION_MODE=""
+# New Flags for Logic
+INSTALL_DOCKER="N"
+REDIS_MODE="system" # Default to system
 
 # ==============================================================================
 # UTILITY FUNCTIONS
@@ -56,23 +60,18 @@ log_section() {
 }
 
 prompt_user() {
-    local prompt="$1"
-    local default="$2"
-    local result
-    
-    # Print prompt string
-    if [ -n "$default" ]; then
-        read -p "$prompt [$default]: " result
-    else
-        read -p "$prompt: " result
-    fi
-    
-    # Use default if empty
-    result="${result:-$default}"
-    
-    # Specific check for global "back" commands in text inputs
-    # Note: Logic logic handles the flow, this just returns the value.
-    echo "$result"
+		local prompt="$1"
+		local default="$2"
+		local result
+		
+		if [ -n "$default" ]; then
+				read -p "$prompt [$default]: " result
+		else
+				read -p "$prompt: " result
+		fi
+		
+		result="${result:-$default}"
+		echo "$result"
 }
 
 prompt_password() {
@@ -80,12 +79,8 @@ prompt_password() {
 	local pass1 pass2
 	
 	while true; do
-		echo -n "$prompt: "
-		read -s pass1
-		echo ""
-		echo -n "Confirm Password: "
-		read -s pass2
-		echo ""
+		read -p "$prompt: " pass1
+		read -p "Confirm Password: " pass2
 		
 		if [ "$pass1" == "$pass2" ] && [ -n "$pass1" ]; then
 			echo "$pass1"
@@ -95,6 +90,7 @@ prompt_password() {
 		fi
 	done
 }
+
 
 validate_integer() {
 	local value="$1"
@@ -114,6 +110,26 @@ create_backup() {
 		mkdir -p "$backup_dir"
 		cp "$file_path" "$backup_dir/"
 		log_success "Backed up: $file_path"
+	fi
+}
+
+detect_ssh_port() {
+	# Safely detect SSH port, default to 22 if failed
+	local port="22"
+	if [ -f /etc/ssh/sshd_config ]; then
+		local detected=$(grep "^Port" /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
+		if [ -n "$detected" ]; then
+			port="$detected"
+		fi
+	fi
+	echo "$port"
+}
+
+check_docker_status() {
+	if command -v docker &>/dev/null; then
+		return 0 # Installed
+	else
+		return 1 # Not installed
 	fi
 }
 
@@ -143,32 +159,46 @@ check_and_install_tool() {
 # ==============================================================================
 
 fetch_postgresql_versions() {
-	local versions
-	# Fix: Used grep -oE (Standard) instead of -P (Perl)
-	# 1. grep -oE extracts 'v16.1'
-	# 2. tr -d 'v' removes the 'v'
-	# 3. awk -F. '{print $1}' keeps only the Major version (e.g. 16) for apt compatibility
-	# 4. sort -Vu sorts unique versions
-	versions=$(curl -s https://www.postgresql.org/ftp/source/ | grep -oE 'v[0-9]+\.[0-9]+' | tr -d 'v' | awk -F. '{print $1}' | sort -Vru | head -10)
-	
-	if [ -z "$versions" ]; then
-		echo "13 14 15 16 17"
-	else
-		echo "$versions" | tr '\n' ' '
-	fi
+    # Primary method: scrape PostgreSQL official source archive
+    versions=$(
+        curl -s https://www.postgresql.org/ftp/source/ \
+        | grep -oE 'v[0-9]+\.[0-9]+' \
+        | sed 's/^v//' \
+        | cut -d. -f1 \
+        | sort -Vru \
+        | uniq \
+        | head -10
+    )
+
+    # If primary fails, try apt-cache
+    if [ -z "$versions" ]; then
+        echo "Primary source failed. Falling back to apt-cache..." >&2
+
+        versions=$(apt-cache search postgresql \
+            | grep -oE 'postgresql-[0-9]+' \
+            | grep -oE '[0-9]+' \
+            | sort -Vru \
+            | uniq \
+            | head -10
+        )
+    fi
+
+    # If both fail → use hardcoded safe defaults
+    if [ -z "$versions" ]; then
+        echo "Both primary and fallback failed. Using hardcoded versions." >&2
+        echo "13 14 15 16 17"
+        return
+    fi
+
+    # Print versions (space-separated)
+    echo "$versions" | tr '\n' ' '
 }
 
 fetch_java_versions() {
 	local versions
-	# 1. Check apt-cache for packages matching 'openjdk-[number]-jre-headless'
-	# 2. Extract the pattern (grep -oE)
-	# 3. Extract just the number
-	# 4. Sort Unique (Version sort)
-	# 5. Format as single line
 	versions=$(apt-cache search openjdk | grep -oE 'openjdk-[0-9]+-jre-headless' | grep -oE '[0-9]+' | sort -Vu | tr '\n' ' ')
 	
 	if [ -z "$versions" ]; then
-		# Fallback if apt cache is empty or network is down
 		echo "8 11 17 21"
 	else
 		echo "$versions"
@@ -177,8 +207,6 @@ fetch_java_versions() {
 
 fetch_node_versions() {
 	local versions
-	# Fix: Used grep -oE instead of -P
-	# Extracts v20.11.0, removes 'v', sorts by Version Reverse
 	versions=$(curl -s https://nodejs.org/dist/ | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | tr -d 'v' | sort -Vr | head -20)
 	
 	if [ -z "$versions" ]; then
@@ -191,7 +219,6 @@ fetch_node_versions() {
 validate_version_exists() {
 	local version="$1"
 	local available_versions="$2"
-	
 	echo "$available_versions" | grep -qw "$version"
 }
 
@@ -383,9 +410,46 @@ collect_node_config() {
 }
 
 collect_services_config() {
-	log_section "Additional Services"
+	log_section "Additional Services & Redis Options"
 	
 	INSTALL_REDIS=$(prompt_user "Install Redis? [y/N]" "N")
+	REDIS_MODE="none"
+
+	if [[ "$INSTALL_REDIS" =~ ^[Yy]$ ]]; then
+		while true; do
+			echo ""
+			echo "How should Redis be installed?"
+			echo "  1) System (APT Package) - Recommended for stability"
+			echo "  2) Docker Container - Recommended for isolation"
+			local redis_choice=$(prompt_user "Choose option [1/2]" "1")
+			
+			if [ "$redis_choice" == "1" ]; then
+				REDIS_MODE="system"
+				break
+			elif [ "$redis_choice" == "2" ]; then
+				# IDIOT PROOFING START
+				if check_docker_status; then
+					REDIS_MODE="docker"
+					break
+				else
+					log_warning "Docker is NOT installed."
+					local auto_install=$(prompt_user "Do you want to install Docker automatically? [Y/n]" "Y")
+					
+					if [[ ! "$auto_install" =~ ^[Nn]$ ]]; then
+						INSTALL_DOCKER="Y" # Flag to install docker in main loop
+						REDIS_MODE="docker"
+						break
+					else
+						log_error "Cannot use Docker mode without Docker. Please choose System mode or install Docker first."
+					fi
+				fi
+				# IDIOT PROOFING END
+			else
+				log_error "Invalid choice."
+			fi
+		done
+	fi
+
 	INSTALL_RABBITMQ=$(prompt_user "Install RabbitMQ? [y/N]" "N")
 }
 
@@ -455,7 +519,7 @@ update_nginx_config() {
 	collect_frontend_config
 	
 	if [ "$DRY_RUN" = false ]; then
-		create_backup "/etc/nginx/sites-available/default" "$BACKUP_ROOT/$TIMESTAMP"
+		create_backup "/etc/nginx/sites-available/$SERVICE_NAME" "$BACKUP_ROOT/$TIMESTAMP"
 		generate_nginx_config
 		nginx -t && systemctl reload nginx
 		log_success "Nginx configuration updated"
@@ -509,7 +573,7 @@ update_all_configs() {
 	collect_frontend_config
 	
 	if [ "$DRY_RUN" = false ]; then
-		create_backup "/etc/nginx/sites-available/default" "$BACKUP_ROOT/$TIMESTAMP"
+		create_backup "/etc/nginx/sites-available/$SERVICE_NAME" "$BACKUP_ROOT/$TIMESTAMP"
 		create_backup "/etc/systemd/system/$SERVICE_NAME.service" "$BACKUP_ROOT/$TIMESTAMP"
 		
 		generate_backend_config
@@ -531,395 +595,347 @@ update_all_configs() {
 # ==============================================================================
 
 show_install_menu() {
-    log_section "Install Services Menu"
-    
-    echo "What would you like to install?"
-    echo ""
-    echo "  1) Java (OpenJDK)"
-    echo "  2) PostgreSQL"
-    echo "  3) Redis"
-    echo "  4) RabbitMQ"
-    echo "  5) Node.js/NVM"
-    echo "  6) Nginx"
-    echo "  7) Docker (Engine & Compose)"
-    echo "  8) All Services (Excluding Docker)"
-    echo "  9) Back to Main Menu"
-    echo ""
-    
-    local choice=$(prompt_user "Enter your choice [1-9]" "9")
-    
-    case $choice in
-        1) install_java_interactive ;;
-        2) install_postgresql_interactive ;;
-        3) install_redis_interactive ;;
-        4) install_rabbitmq_interactive ;;
-        5) install_node_interactive ;;
-        6) install_nginx_interactive ;;
-        7) install_docker_interactive ;;
-        8) install_all_services ;;
-        9) show_main_menu ;;
-        *) log_error "Invalid choice"; show_install_menu ;;
-    esac
+		log_section "Install Services Menu"
+		
+		echo "What would you like to install?"
+		echo ""
+		echo "  1) Java (OpenJDK)"
+		echo "  2) PostgreSQL"
+		echo "  3) Redis"
+		echo "  4) RabbitMQ"
+		echo "  5) Node.js/NVM"
+		echo "  6) Nginx"
+		echo "  7) Docker (Engine & Compose)"
+		echo "  8) All Services (Excluding Docker)"
+		echo "  9) Back to Main Menu"
+		echo ""
+		
+		local choice=$(prompt_user "Enter your choice [1-9]" "9")
+		
+		case $choice in
+				1) install_java_interactive ;;
+				2) install_postgresql_interactive ;;
+				3) install_redis_interactive ;;
+				4) install_rabbitmq_interactive ;;
+				5) install_node_interactive ;;
+				6) install_nginx_interactive ;;
+				7) install_docker_interactive ;;
+				8) install_all_services ;;
+				9) show_main_menu ;;
+				*) log_error "Invalid choice"; show_install_menu ;;
+		esac
 }
 
 install_java_interactive() {
-    log_section "Installing Java"
-    
-    log_info "Fetching available Java versions..."
-    local available_versions=$(fetch_java_versions)
-    
-    # Convert space-separated string to array
-    read -ra ver_array <<< "$available_versions"
-    
-    while true; do
-        echo -e "${CYAN}Available OpenJDK Versions:${NC}"
-        local i=1
-        for ver in "${ver_array[@]}"; do
-            echo "  $i) OpenJDK $ver (LTS)"
-            ((i++))
-        done
-        echo "  c) Custom Version"
-        echo "  b) Back"
-        echo ""
-        
-        local selection=$(prompt_user "Select Version" "1")
-        
-        # Handle Back
-        if [[ "$selection" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
-        
-        # Handle Selection
-        local java_ver=""
-        if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#ver_array[@]}" ]; then
-            java_ver="${ver_array[$((selection-1))]}"
-        elif [[ "$selection" =~ ^[Cc]$ ]]; then
-            java_ver=$(prompt_user "Enter version number (e.g. 19)" "")
-        else
-            log_error "Invalid selection."
-            continue
-        fi
-        
-        # Validate existence
-        local pkg_name="openjdk-${java_ver}-jre-headless"
-        if apt-cache show "$pkg_name" >/dev/null 2>&1; then
-            if [ "$DRY_RUN" = false ]; then
-                log_info "Installing $pkg_name..."
-                apt update -y
-                apt install -y "$pkg_name"
-                log_success "Java $java_ver installed"
-            fi
-            break
-        else
-            log_error "Package '$pkg_name' not found in repositories. Try 'apt update' or choose another version."
-        fi
-    done
-    
-    read -p "Press Enter to continue..."
-    show_install_menu
+		log_section "Installing Java"
+		
+		log_info "Fetching available Java versions..."
+		local available_versions=$(fetch_java_versions)
+		
+		# Convert space-separated string to array
+		read -ra ver_array <<< "$available_versions"
+		
+		while true; do
+				echo -e "${CYAN}Available OpenJDK Versions:${NC}"
+				local i=1
+				for ver in "${ver_array[@]}"; do
+						echo "  $i) OpenJDK $ver (LTS)"
+						((i++))
+				done
+				echo "  c) Custom Version"
+				echo "  b) Back"
+				echo ""
+				
+				local selection=$(prompt_user "Select Version" "1")
+				
+				# Handle Back
+				if [[ "$selection" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
+				
+				# Handle Selection
+				local java_ver=""
+				if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#ver_array[@]}" ]; then
+						java_ver="${ver_array[$((selection-1))]}"
+				elif [[ "$selection" =~ ^[Cc]$ ]]; then
+						java_ver=$(prompt_user "Enter version number (e.g. 19)" "")
+				else
+						log_error "Invalid selection."
+						continue
+				fi
+				
+				# Validate existence
+				local pkg_name="openjdk-${java_ver}-jre-headless"
+				if apt-cache show "$pkg_name" >/dev/null 2>&1; then
+						if [ "$DRY_RUN" = false ]; then
+								log_info "Installing $pkg_name..."
+								apt update -y
+								apt install -y "$pkg_name"
+								log_success "Java $java_ver installed"
+						fi
+						break
+				else
+						log_error "Package '$pkg_name' not found in repositories. Try 'apt update' or choose another version."
+				fi
+		done
+		
+		read -p "Press Enter to continue..."
+		show_install_menu
 }
 
 install_postgresql_interactive() {
-    log_section "Installing PostgreSQL"
-    
-    log_info "Fetching available PostgreSQL versions..."
-    local available_versions=$(fetch_postgresql_versions)
-    read -ra ver_array <<< "$available_versions"
-    
-    while true; do
-        echo -e "${CYAN}Available PostgreSQL Versions:${NC}"
-        local i=1
-        for ver in "${ver_array[@]}"; do
-            echo "  $i) PostgreSQL $ver"
-            ((i++))
-        done
-        echo "  b) Back"
-        echo ""
-        
-        local selection=$(prompt_user "Select Version" "1")
-        if [[ "$selection" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
-        
-        local pg_ver=""
-        if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#ver_array[@]}" ]; then
-            pg_ver="${ver_array[$((selection-1))]}"
-            
-            # DB Config
-            local db_name=$(prompt_user "Database name to create" "stock_db")
-            local db_user=$(prompt_user "Database user to create" "stock_user")
-            local db_pass=$(prompt_password "Database password")
-            
-            if [ "$DRY_RUN" = false ]; then
-                install_postgresql "$pg_ver" "$db_name" "$db_user" "$db_pass"
-                log_success "PostgreSQL $pg_ver installed"
-            fi
-            break
-        else
-            log_error "Invalid selection."
-        fi
-    done
-    
-    read -p "Press Enter to continue..."
-    show_install_menu
+		log_section "Installing PostgreSQL"
+		
+		log_info "Fetching available PostgreSQL versions..."
+		local available_versions=$(fetch_postgresql_versions)
+		read -ra ver_array <<< "$available_versions"
+		
+		while true; do
+				echo -e "${CYAN}Available PostgreSQL Versions:${NC}"
+				local i=1
+				for ver in "${ver_array[@]}"; do
+						echo "  $i) PostgreSQL $ver"
+						((i++))
+				done
+				echo "  b) Back"
+				echo ""
+				
+				local selection=$(prompt_user "Select Version" "1")
+				if [[ "$selection" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
+				
+				local pg_ver=""
+				if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#ver_array[@]}" ]; then
+						pg_ver="${ver_array[$((selection-1))]}"
+						
+						# DB Config
+						local db_name=$(prompt_user "Database name to create" "stock_db")
+						local db_user=$(prompt_user "Database user to create" "stock_user")
+						local db_pass=$(prompt_password "Database password")
+						
+						if [ "$DRY_RUN" = false ]; then
+								install_postgresql "$pg_ver" "$db_name" "$db_user" "$db_pass"
+								log_success "PostgreSQL $pg_ver installed"
+						fi
+						break
+				else
+						log_error "Invalid selection."
+				fi
+		done
+		
+		read -p "Press Enter to continue..."
+		show_install_menu
 }
 
 install_redis_interactive() {
-    log_section "Installing Redis"
-    
-    # 1. Install Redis Server (System)
-    log_info "Checking available Redis version..."
-    local candidate_ver=$(apt-cache policy redis-server | grep Candidate | awk '{print $2}')
-    
-    if [ -z "$candidate_ver" ]; then
-        [ "$DRY_RUN" = false ] && apt update -y
-        candidate_ver=$(apt-cache policy redis-server | grep Candidate | awk '{print $2}')
-    fi
+		log_section "Installing Redis"
+		
+		echo "How would you like to install Redis?"
+		echo "  1) System (APT)"
+		echo "  2) Docker"
+		echo "  b) Back"
+		
+		local method=$(prompt_user "Choice" "1")
+		if [[ "$method" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
 
-    echo ""
-    echo "  Package: redis-server"
-    echo "  Version: ${candidate_ver:-Unknown}"
-    echo ""
-    
-    local confirm=$(prompt_user "Install Redis Server? [Y/n]" "Y")
-    
-    if [[ ! "$confirm" =~ ^[Nn]$ ]] && [ "$DRY_RUN" = false ]; then
-        apt update -y
-        apt install -y redis-server
-        systemctl enable redis-server
-        systemctl start redis-server
-        log_success "Redis installed (Port: 6379)"
-    fi
-    
-    # 2. Redis UI Selection
-    echo ""
-    echo "Redis UI Options:"
-    echo "  1) Redis Commander (NPM - Lightweight, requires Node.js)"
-    echo "  2) Redis Insight   (Docker - Full Featured, requires Docker)"
-    echo "  3) None"
-    echo "  b) Back"
-    
-    local ui_choice=$(prompt_user "Choose UI [1-3]" "3")
-    if [[ "$ui_choice" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
-    
-    case $ui_choice in
-        1) # Redis Commander
-            collect_user_config
-            if sudo -u "$TARGET_USER" bash -c 'command -v npm' &>/dev/null; then
-                if [ "$DRY_RUN" = false ]; then
-                    log_info "Installing Redis Commander..."
-                    sudo -u "$TARGET_USER" bash -c 'npm install -g redis-commander'
-                    
-                    # Service file logic
-                    cat > "/etc/systemd/system/redis-commander.service" <<EOF
-[Unit]
-Description=Redis Commander Web UI
-After=network.target redis-server.service
-[Service]
-User=$TARGET_USER
-ExecStart=$(sudo -u "$TARGET_USER" bash -c 'which redis-commander')
-Environment=PORT=8081
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-                    systemctl daemon-reload
-                    systemctl enable redis-commander
-                    systemctl start redis-commander
-                    log_success "Redis Commander installed (http://YOUR_IP:8081)"
-                fi
-            else
-                log_error "Node.js not found. Install Node/NVM first."
-            fi
-            ;;
-            
-        2) # Redis Insight (Docker)
-            if command -v docker &> /dev/null; then
-                if [ "$DRY_RUN" = false ]; then
-                    log_info "Deploying Redis Insight Container..."
-                    docker pull redis/redisinsight:latest
-                    # Run on port 5540 (default)
-                    docker run -d --name redis-insight --restart always -p 5540:5540 -v redisinsight:/data redis/redisinsight:latest
-                    log_success "Redis Insight installed (http://YOUR_IP:5540)"
-                fi
-            else
-                log_error "Docker not found. Please install Docker first (Option 7)."
-            fi
-            ;;
-    esac
-    
-    read -p "Press Enter to continue..."
-    show_install_menu
+		if [ "$method" == "2" ]; then
+				if ! check_docker_status; then
+						log_warning "Docker is required."
+						local i=$(prompt_user "Install Docker now? [y/N]" "N")
+						if [[ "$i" =~ ^[Yy]$ ]]; then
+								install_docker_engine_logic
+						else
+								log_error "Cannot continue without Docker."
+								return
+						fi
+				fi
+				
+				if [ "$DRY_RUN" = false ]; then
+						 log_info "Starting Redis Container..."
+						 docker run -d --name redis-server --restart always -p 6379:6379 -v redis_data:/data redis:alpine
+						 log_success "Redis (Docker) installed"
+				fi
+				return
+		fi
+		
+		# 1. Install Redis Server (System)
+		log_info "Checking available Redis version..."
+		local candidate_ver=$(apt-cache policy redis-server | grep Candidate | awk '{print $2}')
+		
+		if [ -z "$candidate_ver" ]; then
+				[ "$DRY_RUN" = false ] && apt update -y
+				candidate_ver=$(apt-cache policy redis-server | grep Candidate | awk '{print $2}')
+		fi
+
+		echo ""
+		echo "  Package: redis-server"
+		echo "  Version: ${candidate_ver:-Unknown}"
+		echo ""
+		
+		local confirm=$(prompt_user "Install Redis Server? [Y/n]" "Y")
+		
+		if [[ ! "$confirm" =~ ^[Nn]$ ]] && [ "$DRY_RUN" = false ]; then
+				apt update -y
+				apt install -y redis-server
+				systemctl enable redis-server
+				systemctl start redis-server
+				log_success "Redis installed (Port: 6379)"
+		fi
+		
+		read -p "Press Enter to continue..."
+		show_install_menu
 }
 
 install_rabbitmq_interactive() {
-    log_section "Installing RabbitMQ"
-    
-    log_info "Checking available RabbitMQ version..."
-    local candidate_ver=$(apt-cache policy rabbitmq-server | grep Candidate | awk '{print $2}')
-    
-    echo ""
-    echo "  Package: rabbitmq-server"
-    echo "  Version: ${candidate_ver:-Unknown}"
-    echo ""
-    
-    echo "Options:"
-    echo "  y) Install"
-    echo "  n) Cancel"
-    echo "  b) Back"
-    local confirm=$(prompt_user "Proceed?" "y")
-    
-    if [[ "$confirm" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
-    
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        if [ "$DRY_RUN" = false ]; then
-            apt update -y
-            apt install -y rabbitmq-server
-            
-            log_info "Enabling Management Plugin..."
-            rabbitmq-plugins enable rabbitmq_management
-            
-            systemctl enable rabbitmq-server
-            systemctl start rabbitmq-server
-            
-            log_success "RabbitMQ installed (UI: http://localhost:15672 - guest/guest)"
-        fi
-    else
-        log_warning "Installation cancelled."
-    fi
-    
-    read -p "Press Enter to continue..."
-    show_install_menu
+		log_section "Installing RabbitMQ"
+		
+		log_info "Checking available RabbitMQ version..."
+		local candidate_ver=$(apt-cache policy rabbitmq-server | grep Candidate | awk '{print $2}')
+		
+		echo ""
+		echo "  Package: rabbitmq-server"
+		echo "  Version: ${candidate_ver:-Unknown}"
+		echo ""
+		
+		echo "Options:"
+		echo "  y) Install"
+		echo "  n) Cancel"
+		echo "  b) Back"
+		local confirm=$(prompt_user "Proceed?" "y")
+		
+		if [[ "$confirm" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
+		
+		if [[ "$confirm" =~ ^[Yy]$ ]]; then
+				if [ "$DRY_RUN" = false ]; then
+						apt update -y
+						apt install -y rabbitmq-server
+						
+						log_info "Enabling Management Plugin..."
+						rabbitmq-plugins enable rabbitmq_management
+						
+						systemctl enable rabbitmq-server
+						systemctl start rabbitmq-server
+						
+						log_success "RabbitMQ installed (UI: http://localhost:15672 - guest/guest)"
+				fi
+		else
+				log_warning "Installation cancelled."
+		fi
+		
+		read -p "Press Enter to continue..."
+		show_install_menu
 }
 
 install_node_interactive() {
-    log_section "Installing Node.js/NVM"
-    
-    collect_user_config
-    
-    log_info "Fetching available Node versions..."
-    local available_versions=$(fetch_node_versions)
-    read -ra ver_array <<< "$available_versions"
-    
-    while true; do
-        echo -e "${CYAN}Available Node Versions:${NC}"
-        local i=1
-        for ver in "${ver_array[@]}"; do
-            echo "  $i) Node $ver"
-            ((i++))
-        done
-        echo "  l) Latest LTS (Recommended)"
-        echo "  b) Back"
-        echo ""
-        
-        local selection=$(prompt_user "Select Version" "l")
-        if [[ "$selection" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
-        
-        local node_ver=""
-        if [[ "$selection" =~ ^[Ll]$ ]]; then
-            node_ver="lts"
-        elif [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#ver_array[@]}" ]; then
-            node_ver="${ver_array[$((selection-1))]}"
-        else
-            log_error "Invalid selection."
-            continue
-        fi
-        
-        if [ "$DRY_RUN" = false ]; then
-            install_nvm_for_user "$TARGET_USER" "$node_ver"
-            log_success "Node.js installed for $TARGET_USER"
-        fi
-        break
-    done
-    
-    read -p "Press Enter to continue..."
-    show_install_menu
+		log_section "Installing Node.js/NVM"
+		
+		collect_user_config
+		
+		log_info "Fetching available Node versions..."
+		local available_versions=$(fetch_node_versions)
+		read -ra ver_array <<< "$available_versions"
+		
+		while true; do
+				echo -e "${CYAN}Available Node Versions:${NC}"
+				local i=1
+				for ver in "${ver_array[@]}"; do
+						echo "  $i) Node $ver"
+						((i++))
+				done
+				echo "  l) Latest LTS (Recommended)"
+				echo "  b) Back"
+				echo ""
+				
+				local selection=$(prompt_user "Select Version" "l")
+				if [[ "$selection" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
+				
+				local node_ver=""
+				if [[ "$selection" =~ ^[Ll]$ ]]; then
+						node_ver="lts"
+				elif [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#ver_array[@]}" ]; then
+						node_ver="${ver_array[$((selection-1))]}"
+				else
+						log_error "Invalid selection."
+						continue
+				fi
+				
+				if [ "$DRY_RUN" = false ]; then
+						install_nvm_for_user "$TARGET_USER" "$node_ver"
+						log_success "Node.js installed for $TARGET_USER"
+				fi
+				break
+		done
+		
+		read -p "Press Enter to continue..."
+		show_install_menu
 }
 
 install_nginx_interactive() {
-    log_section "Installing Nginx"
-    
-    echo "Options:"
-    echo "  y) Install Nginx"
-    echo "  b) Back"
-    local confirm=$(prompt_user "Proceed?" "y")
-    
-    if [[ "$confirm" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
-    
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        if [ "$DRY_RUN" = false ]; then
-            apt update -y
-            apt install -y nginx
-            log_success "Nginx installed"
-        fi
-    fi
-    
-    read -p "Press Enter to continue..."
-    show_install_menu
+		log_section "Installing Nginx"
+		
+		echo "Options:"
+		echo "  y) Install Nginx"
+		echo "  b) Back"
+		local confirm=$(prompt_user "Proceed?" "y")
+		
+		if [[ "$confirm" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
+		
+		if [[ "$confirm" =~ ^[Yy]$ ]]; then
+				if [ "$DRY_RUN" = false ]; then
+						apt update -y
+						apt install -y nginx
+						log_success "Nginx installed"
+				fi
+		fi
+		
+		read -p "Press Enter to continue..."
+		show_install_menu
 }
 
 install_docker_interactive() {
-    log_section "Installing Docker"
-    
-    if command -v docker &> /dev/null; then
-        log_warning "Docker is already installed."
-        docker --version
-    else
-        echo "This will install Docker Engine (Community) from the official repository."
-        echo "Options:"
-        echo "  y) Proceed"
-        echo "  b) Back"
-        local confirm=$(prompt_user "Proceed?" "Y")
-        
-        if [[ "$confirm" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
-        
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            if [ "$DRY_RUN" = false ]; then
-                log_info "Setting up Docker repository..."
-                apt remove -y docker docker-engine docker.io containerd runc || true
-                apt update -y
-                apt install -y ca-certificates curl gnupg
-                
-                install -m 0755 -d /etc/apt/keyrings
-                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-                chmod a+r /etc/apt/keyrings/docker.gpg
-                
-                echo \
-                  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-                  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-                  tee /etc/apt/sources.list.d/docker.list > /dev/null
-                
-                apt update -y
-                apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-                
-                collect_user_config
-                log_info "Adding $TARGET_USER to 'docker' group..."
-                usermod -aG docker "$TARGET_USER"
-                
-                log_success "Docker installed."
-            fi
-        fi
-    fi
-    read -p "Press Enter to continue..."
-    show_install_menu
+		log_section "Installing Docker"
+		
+		if check_docker_status; then
+				log_warning "Docker is already installed."
+				docker --version
+		else
+				echo "This will install Docker Engine (Community) from the official repository."
+				echo "Options:"
+				echo "  y) Proceed"
+				echo "  b) Back"
+				local confirm=$(prompt_user "Proceed?" "Y")
+				
+				if [[ "$confirm" =~ ^[Bb]$ ]]; then show_install_menu; return; fi
+				
+				if [[ "$confirm" =~ ^[Yy]$ ]]; then
+						if [ "$DRY_RUN" = false ]; then
+								install_docker_engine_logic
+								log_success "Docker installed."
+						fi
+				fi
+		fi
+		read -p "Press Enter to continue..."
+		show_install_menu
 }
 
 install_all_services() {
-    log_info "Installing all services (Non-Interactive Mode)..."
-    
-    collect_user_config
-    collect_database_config
-    collect_services_config
-    
-    if [ "$DRY_RUN" = false ]; then
-        apt update -y
-        apt install -y openjdk-17-jre-headless nginx ufw acl curl gnupg2 lsb-release ca-certificates
-        
-        [[ "$INSTALL_PG" =~ ^[Yy]$ ]] && install_postgresql "$PG_VER" "$DB_NAME" "$DB_USER" "$DB_PASS"
-        [[ "$INSTALL_REDIS" =~ ^[Yy]$ ]] && apt install -y redis-server
-        [[ "$INSTALL_RABBITMQ" =~ ^[Yy]$ ]] && apt install -y rabbitmq-server && rabbitmq-plugins enable rabbitmq_management
-        
-        log_success "All services installed"
-    fi
-    
-    read -p "Press Enter to continue..."
-    show_install_menu
+		log_info "Installing all services (Non-Interactive Mode)..."
+		
+		collect_user_config
+		collect_database_config
+		collect_services_config
+		
+		if [ "$DRY_RUN" = false ]; then
+				apt update -y
+				# ADDED GIT HERE (FIX #1)
+				apt install -y openjdk-17-jre-headless nginx ufw acl curl gnupg2 lsb-release ca-certificates git
+				
+				[[ "$INSTALL_PG" =~ ^[Yy]$ ]] && install_postgresql "$PG_VER" "$DB_NAME" "$DB_USER" "$DB_PASS"
+				[[ "$INSTALL_REDIS" =~ ^[Yy]$ ]] && apt install -y redis-server
+				[[ "$INSTALL_RABBITMQ" =~ ^[Yy]$ ]] && apt install -y rabbitmq-server && rabbitmq-plugins enable rabbitmq_management
+				
+				log_success "All services installed"
+		fi
+		
+		read -p "Press Enter to continue..."
+		show_install_menu
 }
 
 # ==============================================================================
@@ -1116,7 +1132,7 @@ regenerate_nginx() {
 	collect_frontend_config
 	
 	if [ "$DRY_RUN" = false ]; then
-		create_backup "/etc/nginx/sites-available/default" "$BACKUP_ROOT/$TIMESTAMP"
+		create_backup "/etc/nginx/sites-available/$SERVICE_NAME" "$BACKUP_ROOT/$TIMESTAMP"
 		generate_nginx_config
 		nginx -t && systemctl reload nginx
 		log_success "Nginx configuration regenerated"
@@ -1172,6 +1188,33 @@ regenerate_all() {
 # INSTALLATION FUNCTIONS (Core Logic)
 # ==============================================================================
 
+install_docker_engine_logic() {
+		log_info "Setting up Docker repository..."
+		apt remove -y docker docker-engine docker.io containerd runc || true
+		apt update -y
+		apt install -y ca-certificates curl gnupg
+		
+		install -m 0755 -d /etc/apt/keyrings
+		if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
+				curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+				chmod a+r /etc/apt/keyrings/docker.gpg
+		fi
+		
+		echo \
+			"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+			$(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+			tee /etc/apt/sources.list.d/docker.list > /dev/null
+		
+		apt update -y
+		apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+		
+		# We might need TARGET_USER here, ensure it's set
+		if [ -n "$TARGET_USER" ]; then
+				log_info "Adding $TARGET_USER to 'docker' group..."
+				usermod -aG docker "$TARGET_USER"
+		fi
+}
+
 install_postgresql() {
 	local pg_ver="$1"
 	local db_name="$2"
@@ -1182,7 +1225,9 @@ install_postgresql() {
 	
 	# Modern Keyring Method
 	install -d /usr/share/postgresql-common/pgdg
-	curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+	if [ ! -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc ]; then
+		curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+	fi
 	sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
 	
 	apt update -y
@@ -1199,14 +1244,18 @@ install_postgresql() {
 		sudo -u postgres psql -c "CREATE DATABASE $db_name OWNER $db_user;"
 	fi
 	
-	# Configure authentication
+	# Configure authentication (FIX #2: Safer than sed)
 	local pg_conf="/etc/postgresql/$pg_ver/main/pg_hba.conf"
 	if [ -f "$pg_conf" ]; then
+		# Back up config
 		cp "$pg_conf" "$pg_conf.bak.$(date +%s)"
-		sed -i 's/^local[[:space:]]\+all[[:space:]]\+all[[:space:]]\+peer/local all all scram-sha-256/' "$pg_conf"
+		
+		# Add TCP listener for localhost with scram-sha-256
 		if ! grep -q "host    all             all             127.0.0.1/32            scram-sha-256" "$pg_conf"; then
+			echo "# Added by CI/CD Setup Script" >> "$pg_conf"
 			echo "host    all             all             127.0.0.1/32            scram-sha-256" >> "$pg_conf"
 		fi
+		
 		systemctl restart postgresql
 	fi
 	
@@ -1247,20 +1296,14 @@ generate_backend_config() {
 	
 	mkdir -p "$config_dir"
 
-	# --- FIX START: Check for missing DB Credentials ---
-	# If we are regenerating config, we might not have collected DB info yet.
+	# --- Check for missing DB Credentials ---
 	if [[ "$INSTALL_PG" =~ ^[Yy]$ ]] || [ -z "$DB_PASS" ]; then
 		log_warning "Database credentials required for configuration generation."
-		
-		# Only prompt if they weren't set previously
 		[ -z "$DB_NAME" ] && DB_NAME=$(prompt_user "Database Name" "stock_db")
 		[ -z "$DB_USER" ] && DB_USER=$(prompt_user "Database User" "stock_user")
 		[ -z "$DB_PASS" ] && DB_PASS=$(prompt_password "Enter Database Password")
-		
-		# Ensure Install Flag is set so the if-block below generates PG config
 		INSTALL_PG="y" 
 	fi
-	# --- FIX END ---
 	
 	local db_config=""
 	if [[ "$INSTALL_PG" =~ ^[Yy]$ ]]; then
@@ -1334,10 +1377,13 @@ EOF
 }
 
 generate_nginx_config() {
-	cat > "/etc/nginx/sites-available/default" <<EOF
+	# FIX #3: Use specific filename to avoid overwriting default site
+	local nginx_conf="/etc/nginx/sites-available/$SERVICE_NAME"
+	
+	cat > "$nginx_conf" <<EOF
 server {
-	listen 80 default_server;
-	listen [::]:80 default_server;
+	listen 80;
+	listen [::]:80;
 
 	server_name _;
 	root $UI_PATH;
@@ -1360,6 +1406,9 @@ server {
 	}
 }
 EOF
+		# Symlink and remove default if conflicting
+		ln -sf "$nginx_conf" "/etc/nginx/sites-enabled/"
+		log_info "Generated Nginx config at $nginx_conf"
 }
 
 generate_github_workflows() {
@@ -1374,69 +1423,69 @@ generate_github_workflows() {
 name: Deploy Backend
 
 on:
-  push:
+	push:
 	branches: [ "$SPRING_PROFILE" ]
 
 jobs:
-  build:
+	build:
 	runs-on: self-hosted
 	env:
-	  MAVEN_OPTS: "-Xmx1024m"
+		MAVEN_OPTS: "-Xmx1024m"
 
 	steps:
-	  - name: Checkout code
+		- name: Checkout code
 		uses: actions/checkout@v3
-	  
-	  - name: Set up JDK 17
+		
+		- name: Set up JDK 17
 		uses: actions/setup-java@v3
 		with:
-		  java-version: '17'
-		  distribution: 'temurin'
-		  cache: maven
+			java-version: '17'
+			distribution: 'temurin'
+			cache: maven
 
-	  - name: Build with Maven
+		- name: Build with Maven
 		run: $maven_cmd
 
-	  - name: Backup Current Deployment
+		- name: Backup Current Deployment
 		run: |
-		  if [ -f "${API_PATH}/app.jar" ]; then
+			if [ -f "${API_PATH}/app.jar" ]; then
 			cp "${API_PATH}/app.jar" "${API_PATH}/app.jar.bak"
-		  fi
+			fi
 
-	  - name: Deploy to Server
+		- name: Deploy to Server
 		run: |
-		  cp target/*.jar "${API_PATH}/app.jar"
-		  sudo systemctl restart "${SERVICE_NAME}"
+			cp target/*.jar "${API_PATH}/app.jar"
+			sudo systemctl restart "${SERVICE_NAME}"
 
-	  - name: Verify Health (Actuator)
+		- name: Verify Health (Actuator)
 		run: |
-		  echo "Waiting for service to start (Max ${HEALTH_CHECK_DELAY}s)..."
-		  for i in {1..${HEALTH_CHECK_DELAY}}; do
+			echo "Waiting for service to start (Max ${HEALTH_CHECK_DELAY}s)..."
+			for i in {1..${HEALTH_CHECK_DELAY}}; do
 			 if curl -s -f http://localhost:${API_PORT}${API_PREFIX}/actuator/health > /dev/null 2>&1; then
 				echo "✅ Service Health Check Passed (Attempt \\\$i)"
 				exit 0
 			 fi
 			 sleep 1
-		  done
-		  
-		  echo "❌ Health Check Failed after ${HEALTH_CHECK_DELAY} attempts"
-		  echo "ℹ️  Ensure 'spring-boot-starter-actuator' is in your pom.xml!"
-		  exit 1
+			done
+			
+			echo "❌ Health Check Failed after ${HEALTH_CHECK_DELAY} attempts"
+			echo "ℹ️  Ensure 'spring-boot-starter-actuator' is in your pom.xml!"
+			exit 1
 
-	  - name: Rollback on Failure
+		- name: Rollback on Failure
 		if: failure()
 		run: |
-		  echo "⚠️ DEPLOYMENT FAILED. Initiating Rollback..."
-		  if [ -f "${API_PATH}/app.jar.bak" ]; then
+			echo "⚠️ DEPLOYMENT FAILED. Initiating Rollback..."
+			if [ -f "${API_PATH}/app.jar.bak" ]; then
 			mv "${API_PATH}/app.jar" "${API_PATH}/app.jar.failed"
 			mv "${API_PATH}/app.jar.bak" "${API_PATH}/app.jar"
 			sudo systemctl restart "${SERVICE_NAME}"
 			echo "✅ Rollback successful."
-		  else
+			else
 			echo "❌ No backup found to restore."
-		  fi
-		  
-	  - name: Cleanup Backup
+			fi
+			
+		- name: Cleanup Backup
 		if: success()
 		run: rm -f "${API_PATH}/app.jar.bak"
 EOF
@@ -1445,13 +1494,13 @@ EOF
 	local frontend_build=""
 	if [ "$FRONTEND_ENV_STRATEGY" == "2" ] && [ -n "$VITE_VAR_NAME" ]; then
 		frontend_build="
-	  - name: Build project
+		- name: Build project
 		run: npm run build
 		env:
-		  $VITE_VAR_NAME: \\\${{ secrets.$VITE_VAR_NAME }}"
+			$VITE_VAR_NAME: \\\${{ secrets.$VITE_VAR_NAME }}"
 	else
 		frontend_build="
-	  - name: Build project
+		- name: Build project
 		run: npm run build"
 	fi
 
@@ -1459,60 +1508,60 @@ EOF
 name: Deploy Frontend
 
 on:
-  push:
+	push:
 	branches: [ "$SPRING_PROFILE" ]
 
 jobs:
-  build:
+	build:
 	runs-on: self-hosted
 
 	steps:
-	  - name: Checkout code
+		- name: Checkout code
 		uses: actions/checkout@v3
 
-	  - name: Use Node.js
+		- name: Use Node.js
 		uses: actions/setup-node@v3
 		with:
-		  node-version: lts/*
-		  cache: 'npm'
+			node-version: lts/*
+			cache: 'npm'
 
-	  - name: Install dependencies
+		- name: Install dependencies
 		run: npm ci
 $frontend_build
 
-	  - name: Backup Current Deployment
+		- name: Backup Current Deployment
 		run: |
-		  if [ -d "${UI_PATH}" ]; then
+			if [ -d "${UI_PATH}" ]; then
 			 rm -rf "${UI_PATH}.bak"
 			 mkdir -p "${UI_PATH}.bak"
 			 cp -a "${UI_PATH}/." "${UI_PATH}.bak/"
-		  fi
+			fi
 
-	  - name: Deploy to Nginx
+		- name: Deploy to Nginx
 		run: |
-		  find "${UI_PATH}" -mindepth 1 -delete
-		  cp -r "${BUILD_DIR}"/* "${UI_PATH}/"
+			find "${UI_PATH}" -mindepth 1 -delete
+			cp -r "${BUILD_DIR}"/* "${UI_PATH}/"
 
-	  - name: Verify Deployment
+		- name: Verify Deployment
 		run: |
-		  if [ -f "${UI_PATH}/index.html" ]; then
+			if [ -f "${UI_PATH}/index.html" ]; then
 			echo "✅ Frontend deployed successfully"
-		  else
+			else
 			echo "❌ Deployment verification failed"
 			exit 1
-		  fi
+			fi
 
-	  - name: Rollback on Failure
+		- name: Rollback on Failure
 		if: failure()
 		run: |
-		  echo "⚠️ DEPLOYMENT FAILED. Initiating Rollback..."
-		  if [ -d "${UI_PATH}.bak" ]; then
+			echo "⚠️ DEPLOYMENT FAILED. Initiating Rollback..."
+			if [ -d "${UI_PATH}.bak" ]; then
 			 find "${UI_PATH}" -mindepth 1 -delete
 			 cp -a "${UI_PATH}.bak/." "${UI_PATH}/"
 			 echo "✅ Rollback successful."
-		  fi
-		  
-	  - name: Cleanup Backup
+			fi
+			
+		- name: Cleanup Backup
 		if: success()
 		run: rm -rf "${UI_PATH}.bak"
 EOF
@@ -1539,7 +1588,8 @@ reconfigure_postgresql() {
 	local pg_conf="/etc/postgresql/$pg_ver/main/pg_hba.conf"
 	if [ -f "$pg_conf" ]; then
 		cp "$pg_conf" "$pg_conf.bak.$(date +%s)"
-		sed -i 's/^local[[:space:]]\+all[[:space:]]\+all[[:space:]]\+peer/local all all scram-sha-256/' "$pg_conf"
+		# Safe Append instead of Sed
+		echo "host    all             all             127.0.0.1/32            scram-sha-256" >> "$pg_conf"
 		systemctl restart postgresql
 		log_success "PostgreSQL reconfigured"
 	fi
@@ -1582,107 +1632,109 @@ update_db_password() {
 # ==============================================================================
 
 restore_from_backup() {
-    log_section "Restore Mode"
-    
-    # 1. Check if backup root exists
-    if [ ! -d "$BACKUP_ROOT" ]; then
-        log_warning "No backup directory found at $BACKUP_ROOT"
-        echo "Run a Full Setup or Update Config first to generate backups."
-        read -p "Press Enter to return to menu..."
-        return 0
-    fi
-    
-    # 2. Get list of backups into an array
-    # Uses mapfile to handle filenames with spaces safely, sorted by newest first
-    mapfile -t backups < <(ls -1t "$BACKUP_ROOT" 2>/dev/null)
+		log_section "Restore Mode"
+		
+		# 1. Check if backup root exists
+		if [ ! -d "$BACKUP_ROOT" ]; then
+				log_warning "No backup directory found at $BACKUP_ROOT"
+				echo "Run a Full Setup or Update Config first to generate backups."
+				read -p "Press Enter to return to menu..."
+				return 0
+		fi
+		
+		# 2. Get list of backups into an array
+		# Uses mapfile to handle filenames with spaces safely, sorted by newest first
+		mapfile -t backups < <(ls -1t "$BACKUP_ROOT" 2>/dev/null)
 
-    # 3. Check if directory is empty
-    if [ ${#backups[@]} -eq 0 ]; then
-        log_warning "Backup directory exists but is empty."
-        read -p "Press Enter to return to menu..."
-        return 0
-    fi
-    
-    # 4. Selection Menu Loop
-    while true; do
-        echo "Available backups (Newest first):"
-        echo ""
-        
-        # Loop through array to display numbered list
-        for i in "${!backups[@]}"; do
-            # Format timestamp for readability if it matches standard format
-            local ts="${backups[$i]}"
-            echo "  $((i+1))) $ts"
-        done
-        echo ""
-        echo "  b) 🔙 Back to Main Menu"
-        echo ""
-        
-        local selection
-        read -p "Select backup to restore [1-${#backups[@]}]: " selection
-        
-        # Handle Back
-        if [[ "$selection" =~ ^[Bb]$ ]]; then
-            return 0
-        fi
-        
-        # Handle Empty (Loop again)
-        if [ -z "$selection" ]; then
-            continue
-        fi
-        
-        # Validate Number
-        if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#backups[@]}" ]; then
-            # Map selection index (1-based) to array index (0-based)
-            local index=$((selection-1))
-            local restore_ts="${backups[$index]}"
-            local restore_source="$BACKUP_ROOT/$restore_ts"
-            
-            log_info "Selected Backup: $restore_ts"
-            local confirm=$(prompt_user "Are you sure you want to restore this configuration? [y/N]" "N")
-            
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                # === RESTORE LOGIC ===
-                log_info "Restoring from $restore_source..."
-                local restore_count=0
-                
-                # Restore Nginx
-                if [ -f "$restore_source/default" ]; then
-                    cp "$restore_source/default" "/etc/nginx/sites-available/default"
-                    echo -e "   - Restored Nginx config"
-                    ((restore_count++))
-                fi
-                
-                # Restore Services
-                for f in "$restore_source"/*.service; do
-                    if [ -f "$f" ]; then
-                        cp "$f" "/etc/systemd/system/$(basename "$f")"
-                        echo -e "   - Restored Service: $(basename "$f")"
-                        ((restore_count++))
-                    fi
-                done
-                
-                if [ "$restore_count" -eq 0 ]; then
-                    log_warning "Backup folder was empty or contained no recognizable config files."
-                else
-                    # Reload
-                    systemctl daemon-reload
-                    if command -v nginx &> /dev/null; then
-                        nginx -t && systemctl reload nginx
-                    fi
-                    log_success "Restore complete ($restore_count files)."
-                fi
-                
-                read -p "Press Enter to continue..."
-                return 0
-            else
-                echo "Restore cancelled."
-            fi
-        else
-            log_error "Invalid selection. Please enter a number between 1 and ${#backups[@]}."
-        fi
-        echo ""
-    done
+		# 3. Check if directory is empty
+		if [ ${#backups[@]} -eq 0 ]; then
+				log_warning "Backup directory exists but is empty."
+				read -p "Press Enter to return to menu..."
+				return 0
+		fi
+		
+		# 4. Selection Menu Loop
+		while true; do
+				echo "Available backups (Newest first):"
+				echo ""
+				
+				# Loop through array to display numbered list
+				for i in "${!backups[@]}"; do
+						# Format timestamp for readability if it matches standard format
+						local ts="${backups[$i]}"
+						echo "  $((i+1))) $ts"
+				done
+				echo ""
+				echo "  b) 🔙 Back to Main Menu"
+				echo ""
+				
+				local selection
+				read -p "Select backup to restore [1-${#backups[@]}]: " selection
+				
+				# Handle Back
+				if [[ "$selection" =~ ^[Bb]$ ]]; then
+						return 0
+				fi
+				
+				# Handle Empty (Loop again)
+				if [ -z "$selection" ]; then
+						continue
+				fi
+				
+				# Validate Number
+				if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#backups[@]}" ]; then
+						# Map selection index (1-based) to array index (0-based)
+						local index=$((selection-1))
+						local restore_ts="${backups[$index]}"
+						local restore_source="$BACKUP_ROOT/$restore_ts"
+						
+						log_info "Selected Backup: $restore_ts"
+						local confirm=$(prompt_user "Are you sure you want to restore this configuration? [y/N]" "N")
+						
+						if [[ "$confirm" =~ ^[Yy]$ ]]; then
+								# === RESTORE LOGIC ===
+								log_info "Restoring from $restore_source..."
+								local restore_count=0
+								
+								# Restore Nginx (Handle specific filenames now)
+								if [ -f "$restore_source/$SERVICE_NAME" ]; then
+										 cp "$restore_source/$SERVICE_NAME" "/etc/nginx/sites-available/$SERVICE_NAME"
+										 ((restore_count++))
+								elif [ -f "$restore_source/default" ]; then
+										cp "$restore_source/default" "/etc/nginx/sites-available/default"
+										((restore_count++))
+								fi
+								
+								# Restore Services
+								for f in "$restore_source"/*.service; do
+										if [ -f "$f" ]; then
+												cp "$f" "/etc/systemd/system/$(basename "$f")"
+												echo -e "   - Restored Service: $(basename "$f")"
+												((restore_count++))
+										fi
+								done
+								
+								if [ "$restore_count" -eq 0 ]; then
+										log_warning "Backup folder was empty or contained no recognizable config files."
+								else
+										# Reload
+										systemctl daemon-reload
+										if command -v nginx &> /dev/null; then
+												nginx -t && systemctl reload nginx
+										fi
+										log_success "Restore complete ($restore_count files)."
+								fi
+								
+								read -p "Press Enter to continue..."
+								return 0
+						else
+								echo "Restore cancelled."
+						fi
+				else
+						log_error "Invalid selection. Please enter a number between 1 and ${#backups[@]}."
+				fi
+				echo ""
+		done
 }
 
 # ==============================================================================
@@ -1698,7 +1750,7 @@ run_full_setup() {
 	collect_backend_config
 	collect_frontend_config
 	collect_database_config
-	collect_services_config
+	collect_services_config # Now handles Redis Logic
 	collect_node_config
 	
 	if [ "$DRY_RUN" = true ]; then
@@ -1712,7 +1764,13 @@ run_full_setup() {
 	# System preparation
 	log_info "Installing base dependencies..."
 	apt update -y
-	apt install -y nginx ufw acl curl gnupg2 lsb-release ca-certificates
+	# FIX #1: Added GIT
+	apt install -y nginx ufw acl curl gnupg2 lsb-release ca-certificates git
+	
+	# Install Docker if marked by Redis Logic or other Services
+	if [[ "$INSTALL_DOCKER" =~ ^[Yy]$ ]]; then
+		install_docker_engine_logic
+	fi
 	
 	# Install Java with selected version
 	if [[ ! "$INSTALL_JAVA" =~ ^[Nn]$ ]]; then
@@ -1731,9 +1789,15 @@ run_full_setup() {
 	fi
 	
 	if [[ "$INSTALL_REDIS" =~ ^[Yy]$ ]]; then
-		log_info "Installing Redis..."
-		apt install -y redis-server
-		log_success "Redis installed (Port: 6379)"
+		if [ "$REDIS_MODE" == "docker" ]; then
+			log_info "Installing Redis (Docker)..."
+			docker run -d --name redis-server --restart always -p 6379:6379 -v redis_data:/data redis:alpine
+			log_success "Redis Container Started"
+		else
+			log_info "Installing Redis (System)..."
+			apt install -y redis-server
+			log_success "Redis installed (Port: 6379)"
+		fi
 	fi
 	
 	if [[ "$INSTALL_RABBITMQ" =~ ^[Yy]$ ]]; then
@@ -1757,7 +1821,10 @@ run_full_setup() {
 	
 	# Configure firewall
 	log_info "Configuring firewall..."
-	ufw limit ssh
+	# FIX #4: Detect Port dynamically
+	local ssh_port=$(detect_ssh_port)
+	log_info "Detected SSH port: $ssh_port"
+	ufw allow "$ssh_port/tcp"
 	ufw allow 80/tcp
 	ufw allow 443/tcp
 	
@@ -1786,11 +1853,15 @@ show_setup_summary() {
 	
 	echo -e "${CYAN}📦 Services:${NC}"
 	[[ "$INSTALL_PG" =~ ^[Yy]$ ]] && echo "   ✅ PostgreSQL $PG_VER (DB: $DB_NAME, Port: 5432)"
-	[[ "$INSTALL_REDIS" =~ ^[Yy]$ ]] && echo "   ✅ Redis (Port: 6379)"
+	
+	if [[ "$INSTALL_REDIS" =~ ^[Yy]$ ]]; then
+		echo "   ✅ Redis ($REDIS_MODE)"
+	fi
+	
 	[[ "$INSTALL_RABBITMQ" =~ ^[Yy]$ ]] && echo "   ✅ RabbitMQ (UI: http://localhost:15672)"
 	[[ "$INSTALL_NODE" =~ ^[Yy]$ ]] && echo "   ✅ Node.js $NODE_VER (via NVM for $TARGET_USER)"
-	echo ""
 	
+	echo ""
 	echo -e "${CYAN}🚀 Next Steps:${NC}"
 	echo "   1. Copy workflows to your .github/workflows/ folders"
 	echo "   2. Install GitHub self-hosted runners"
